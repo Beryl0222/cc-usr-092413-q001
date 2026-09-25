@@ -1,5 +1,6 @@
 """网络侵害事件受理与协同处置的全链路契约测试。"""
 
+import copy
 import json
 import os
 import tempfile
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 
 from app import AppError, SafeguardingApp, content_hash, suggest_severity
 from service import build_handler
+from store import EventStore
 
 AGENT = {"name": "代理人小林", "role": "当事人代理"}
 OFFICER = {"name": "保护专员阿岚", "role": "俱乐部保护专员"}
@@ -165,8 +167,17 @@ class CallbackIdempotencyTest(unittest.TestCase):
         renamed = dict(self.callback)
         renamed["account"] = {"platform": "douyin", "account_key": "dy_hater_9",
                               "display_name": "改名后的账号名"}
-        response = self.app.platform_callback(renamed)
-        self.assertTrue(response["duplicate"])  # 同 callback_id：不重复处理改名
+        # 同一 callback_id 却携带不同改名内容：明确报冲突，保留首次结果，不写入
+        with self.assertRaises(AppError) as ctx:
+            self.app.platform_callback(renamed)
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.details["error_code"], "callback_conflict")
+        digest = self.app.incident_digest(self.incident_id)
+        self.assertEqual(digest["证据依据"]["linked_accounts"][0]["display_name"],
+                         "改名前的账号名")  # 冲突回调没有部分写入
+        # 完全相同的回调仍安全重放
+        replay = self.app.platform_callback(self.callback)
+        self.assertTrue(replay["duplicate"])
         new_cb = json.loads(json.dumps(self.callback))
         new_cb["callback_id"] = "CB-002"
         new_cb["account"]["display_name"] = "改名后的账号名"
@@ -286,6 +297,500 @@ class ClusteringAndMergingTest(unittest.TestCase):
         self.assertEqual(ctx.exception.status, 409)  # 被合并事件不可再操作
 
 
+class MergedCallbackRoutingTest(unittest.TestCase):
+    """合并后回调归属：三线索统一路由到主案件，子案件冻结，结论跨视图一致。"""
+
+    URL_A = "https://video.example/comment/55"
+    URL_B = "https://video.example/comment/55?mirror=1"
+    TEXT = "这人就该被网暴到退役，全家都不是好东西"
+
+    def _two_reports(self, app, victim="ATH-M1", receipt_a="RA-1", receipt_b="RB-2"):
+        a = app.submit_report(abuse_report(
+            victim_code=victim, content_url=self.URL_A, raw_excerpt=self.TEXT,
+            linked_accounts=[{"platform": "douyin", "account_key": "acc_a",
+                              "display_name": "甲账号"}],
+            receipts=[{"receipt_id": receipt_a, "platform": "douyin", "status": "accepted"}]
+            if receipt_a else []), AGENT)["incident_id"]
+        b = app.submit_report(abuse_report(
+            victim_code=victim, content_url=self.URL_B, raw_excerpt=self.TEXT,
+            linked_accounts=[{"platform": "douyin", "account_key": "acc_b",
+                              "display_name": "乙账号"}],
+            receipts=[{"receipt_id": receipt_b, "platform": "douyin", "status": "accepted"}]
+            if receipt_b else []), AGENT)["incident_id"]
+        return a, b
+
+    def _merge(self, app, a, b):
+        sugg = next(s for s in app.list_suggestions()
+                    if set(s["incident_ids"]) == {a, b})
+        result = app.resolve_suggestion(sugg["suggestion_id"], "accept", OFFICER,
+                                        target_incident=a)
+        self.assertEqual(result["merged_into"], a)
+        return sugg["suggestion_id"]
+
+    def _child_event_count(self, app, child):
+        return len([e for e in app.store.replay()
+                    if e["payload"].get("incident_id") == child])
+
+    # ------------------------------------------------------------ 三线索路由
+    def test_explicit_old_child_id_routes_to_master_and_child_stays_frozen(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        child_events_before = self._child_event_count(app, b)
+
+        response = app.platform_callback({
+            "callback_id": "CB-MERGED-1", "incident_id": b,  # 平台仍带旧子案件编号
+            "receipt": {"receipt_id": "RC-LATE", "platform": "douyin",
+                        "status": "removed", "content_url": self.URL_B}})
+
+        self.assertEqual(response["incident_id"], a)
+        self.assertEqual(response["matched_via"], "explicit_incident_id")
+        self.assertEqual(response["matched_ref"], b)
+        hit_ways = {h["matched_via"] for h in response["match_hits"]}
+        # 显式号与内容引用一致指向同一主案件时，两个命中都保留
+        self.assertEqual(hit_ways, {"explicit_incident_id", "content_ref"})
+
+        digest = app.incident_digest(a)
+        by_url = {e["content_ref"]: e["state"] for e in digest["证据依据"]["evidence"]}
+        self.assertEqual(by_url[self.URL_B], "deleted")  # 删除状态由主案件承接
+        receipt_ids = {r["receipt_id"] for r in digest["证据依据"]["platform_receipts"]}
+        self.assertIn("RC-LATE", receipt_ids)
+        self.assertEqual(digest["absorbed_incidents"], [b])
+
+        child = app.incident_digest(b)
+        self.assertEqual(child["merged_into"], a)
+        self.assertNotIn("RC-LATE",
+                         {r["receipt_id"] for r in child["证据依据"]["platform_receipts"]})
+        # 旧子案件在合并之后没有任何新事件写入
+        self.assertEqual(self._child_event_count(app, b), child_events_before)
+
+    def test_existing_receipt_id_on_child_routes_to_master(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        response = app.platform_callback({
+            "callback_id": "CB-MERGED-2",  # 不带案件号，只带平台原始回执号
+            "receipt": {"receipt_id": "RB-2", "platform": "douyin",
+                        "status": "removed", "content_url": self.URL_B}})
+        self.assertEqual(response["incident_id"], a)
+        self.assertEqual(response["matched_via"], "existing_receipt_id")
+        by_url = {e["content_ref"]: e["state"]
+                  for e in app.incident_digest(a)["证据依据"]["evidence"]}
+        self.assertEqual(by_url[self.URL_B], "deleted")
+
+    def test_content_ref_on_child_routes_to_master(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        response = app.platform_callback({
+            "callback_id": "CB-MERGED-3",
+            "content_url": self.URL_B,  # 仅内容引用命中
+            "receipt": {"receipt_id": "RC-BY-URL", "platform": "douyin",
+                        "status": "removed", "content_url": self.URL_B}})
+        self.assertEqual(response["incident_id"], a)
+        self.assertEqual(response["matched_via"], "content_ref")
+        self.assertIn("content_deleted", response["attached"])
+
+    def test_new_account_via_child_reference_links_to_master(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        app.platform_callback({
+            "callback_id": "CB-MERGED-4", "incident_id": b,
+            "receipt": {"receipt_id": "RC-ACCT", "platform": "douyin",
+                        "status": "accepted"},
+            "account": {"platform": "douyin", "account_key": "acc_new",
+                        "display_name": "新关联账号"}})
+        accounts = {x["account_key"]
+                    for x in app.incident_digest(a)["证据依据"]["linked_accounts"]}
+        self.assertIn("acc_new", accounts)
+        child_accounts = {x["account_key"]
+                          for x in app.incident_digest(b)["证据依据"]["linked_accounts"]}
+        self.assertNotIn("acc_new", child_accounts)
+
+    def test_origin_source_is_recorded_on_each_fact(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        app.platform_callback({
+            "callback_id": "CB-MERGED-5", "incident_id": b,
+            "receipt": {"receipt_id": "RC-ORIGIN", "platform": "douyin",
+                        "status": "removed", "content_url": self.URL_B}})
+        origins = [e["payload"].get("origin", {})
+                   for e in app.store.replay()
+                   if e["payload"].get("origin", {}).get("callback_id") == "CB-MERGED-5"]
+        self.assertTrue(origins)  # 每条新增事实都保留原始命中来源
+        self.assertTrue(all(o["matched_via"] == "explicit_incident_id" for o in origins))
+        self.assertTrue(all(o["matched_ref"] == b for o in origins))
+
+    # ------------------------------------------------------------ 稳定业务错误
+    def test_closed_master_rejects_late_callback_without_creating_case(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        app.close_incident(a, "保护完成", OFFICER)
+        incidents_before = len(app.incidents)
+        with self.assertRaises(AppError) as ctx:
+            app.platform_callback({
+                "callback_id": "CB-CLOSED", "incident_id": b,
+                "receipt": {"receipt_id": "RC-X", "platform": "douyin",
+                            "status": "removed", "content_url": self.URL_B}})
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.details["error_code"], "incident_closed")
+        self.assertEqual(ctx.exception.details["incident_id"], a)
+        self.assertEqual(len(app.incidents), incidents_before)  # 不另立案件
+
+    def test_ambiguous_clues_pointing_to_different_masters_are_rejected(self):
+        app = SafeguardingApp()
+        a, _ = self._two_reports(app, victim="ATH-M2")
+        c = app.submit_report(abuse_report(
+            victim_code="ATH-OTHER", content_url="https://video.example/comment/99",
+            raw_excerpt="另一条完全不同的侵害内容",
+            linked_accounts=[{"platform": "douyin", "account_key": "acc_c"}]), AGENT)["incident_id"]
+        # 显式指向 A，内容引用却属于未合并的 C：无法唯一归属
+        with self.assertRaises(AppError) as ctx:
+            app.platform_callback({
+                "callback_id": "CB-AMB", "incident_id": a,
+                "receipt": {"receipt_id": "RC-AMB", "platform": "douyin",
+                            "content_url": "https://video.example/comment/99"}})
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.details["error_code"], "callback_ambiguous")
+        self.assertEqual(len(ctx.exception.details["candidates"]), 2)
+
+    def test_unknown_explicit_id_is_404_not_a_new_case(self):
+        app = SafeguardingApp()
+        with self.assertRaises(AppError) as ctx:
+            app.platform_callback({"callback_id": "CB-NOID", "incident_id": "inc_ghost"})
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertEqual(ctx.exception.details["error_code"], "incident_not_found")
+        self.assertEqual(app.incidents, {})
+
+    def test_broken_merge_chain_is_reported_as_stable_error(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        # 白箱模拟合并链断裂（主案件记录丢失）与成环两种损坏
+        app.incidents[b]["merged_into"] = "inc_missing"
+        with self.assertRaises(AppError) as ctx:
+            app.platform_callback({"callback_id": "CB-BROKEN", "incident_id": b})
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.details["error_code"], "merge_chain_broken")
+
+        app.incidents[b]["merged_into"] = a
+        app.incidents[a]["merged_into"] = b  # 成环
+        with self.assertRaises(AppError) as ctx2:
+            app.platform_callback({"callback_id": "CB-CYCLE", "incident_id": b})
+        self.assertEqual(ctx2.exception.details["error_code"], "merge_chain_broken")
+
+    # ------------------------------------------------------------ 幂等与冲突
+    def test_same_callback_id_with_different_content_conflicts_and_keeps_first(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        first = app.platform_callback({
+            "callback_id": "CB-DUP", "incident_id": b,
+            "receipt": {"receipt_id": "RC-DUP", "platform": "douyin",
+                        "status": "accepted", "content_url": self.URL_B}})
+        self.assertFalse(first["duplicate"])
+        receipts_before = len(app.store.replay())
+
+        # 同一标识、不同状态：409，明确报冲突，回传首次结果，零写入
+        with self.assertRaises(AppError) as ctx:
+            app.platform_callback({
+                "callback_id": "CB-DUP", "incident_id": b,
+                "receipt": {"receipt_id": "RC-DUP", "platform": "douyin",
+                            "status": "removed", "content_url": self.URL_B}})
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.details["error_code"], "callback_conflict")
+        self.assertEqual(ctx.exception.details["first_result"]["incident_id"], a)
+        self.assertEqual(len(app.store.replay()), receipts_before)
+        by_url = {e["content_ref"]: e["state"]
+                  for e in app.incident_digest(a)["证据依据"]["evidence"]}
+        self.assertEqual(by_url[self.URL_B], "online")  # 删除状态没有被部分写入
+
+        # 首次内容原样重放仍安全
+        replay = app.platform_callback({
+            "callback_id": "CB-DUP", "incident_id": b,
+            "receipt": {"receipt_id": "RC-DUP", "platform": "douyin",
+                        "status": "accepted", "content_url": self.URL_B}})
+        self.assertTrue(replay["duplicate"])
+
+        # 重试时平台改用主案件编号（仅寻址不同，业务内容一致）：仍安全重放
+        replay_master = app.platform_callback({
+            "callback_id": "CB-DUP", "incident_id": a,
+            "receipt": {"receipt_id": "RC-DUP", "platform": "douyin",
+                        "status": "accepted", "content_url": self.URL_B}})
+        self.assertTrue(replay_master["duplicate"])
+        self.assertEqual(replay_master["incident_id"], a)
+
+    # ------------------------------------------------------------ 并发顺序
+    def test_concurrent_merge_and_callback_form_single_explainable_order(self):
+        for _ in range(10):  # 两个顺序各可能出现，反复跑保证两种都收敛到主案件
+            app = SafeguardingApp()
+            a, b = self._two_reports(app)
+            sugg = next(s for s in app.list_suggestions()
+                        if set(s["incident_ids"]) == {a, b})
+            barrier = threading.Barrier(2)
+            errors = []
+
+            def merge():
+                barrier.wait()
+                try:
+                    app.resolve_suggestion(sugg["suggestion_id"], "accept", OFFICER,
+                                           target_incident=a)
+                except AppError as exc:  # 回调先到也不应让合并报错
+                    errors.append(exc)
+
+            def callback():
+                barrier.wait()
+                try:
+                    app.platform_callback({
+                        "callback_id": "CB-RACE", "incident_id": b,
+                        "receipt": {"receipt_id": "RC-RACE", "platform": "douyin",
+                                    "status": "removed", "content_url": self.URL_B}})
+                except AppError as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=merge), threading.Thread(target=callback)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            self.assertEqual(app.incidents[b]["merged_into"], a)
+            by_url = {e["content_ref"]: e["state"]
+                      for e in app.incident_digest(a)["证据依据"]["evidence"]}
+            self.assertEqual(by_url[self.URL_B], "deleted")  # 无论谁先，主案件都承接删除
+            self.assertIn("RC-RACE",
+                          {r["receipt_id"]
+                           for r in app.incident_digest(a)["证据依据"]["platform_receipts"]})
+
+    def test_concurrent_identical_callbacks_apply_exactly_once(self):
+        app = SafeguardingApp()
+        a, b = self._two_reports(app)
+        self._merge(app, a, b)
+        payload = {"callback_id": "CB-FANOUT", "incident_id": b,
+                   "receipt": {"receipt_id": "RC-FAN", "platform": "douyin",
+                               "status": "removed", "content_url": self.URL_B}}
+        results, errors = [], []
+        n = 8
+        barrier = threading.Barrier(n)
+
+        def fire():
+            barrier.wait()
+            try:
+                results.append(app.platform_callback(copy.deepcopy(payload)))
+            except AppError as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=fire) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(1 for r in results if not r["duplicate"]), 1)
+        self.assertEqual(sum(1 for r in results if r["duplicate"]), n - 1)
+        receipts = [r for r in app.incident_digest(a)["证据依据"]["platform_receipts"]
+                    if r["receipt_id"] == "RC-FAN"]
+        self.assertEqual(len(receipts), 1)
+
+    # ------------------------------------------------------------ 跨视图一致
+    def test_notification_query_is_identical_for_child_and_master(self):
+        app = SafeguardingApp()
+        # 直接威胁产生值班通知：两个案件各有通知，合并后查任一编号结论一致
+        a = app.submit_report(threat_report(), AGENT)["incident_id"]
+        app.acknowledge_escalation(a, DUTY)
+        b = app.submit_report(threat_report(
+            content_url="https://weibo.example/comment/90210?m=2"), AGENT)["incident_id"]
+        app.acknowledge_escalation(b, DUTY)
+        self._merge(app, a, b)
+        via_master = app.list_notifications(a)
+        via_child = app.list_notifications(b)
+        self.assertEqual(via_master, via_child)
+        self.assertEqual({n["incident_id"] for n in via_child}, {a, b})
+
+
+class PersistenceMergedCallbackTest(unittest.TestCase):
+    def test_restart_replay_keeps_routing_digest_and_idempotency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "events.jsonl")
+            app = SafeguardingApp(store_path=path)
+            helper = MergedCallbackRoutingTest()
+            a_id = app.submit_report(abuse_report(
+                victim_code="ATH-P", content_url=MergedCallbackRoutingTest.URL_A,
+                raw_excerpt=MergedCallbackRoutingTest.TEXT,
+                linked_accounts=[{"platform": "douyin", "account_key": "pa"}],
+                receipts=[{"receipt_id": "PRA", "platform": "douyin", "status": "accepted"}]
+            ), AGENT)["incident_id"]
+            b_id = app.submit_report(abuse_report(
+                victim_code="ATH-P", content_url=MergedCallbackRoutingTest.URL_B,
+                raw_excerpt=MergedCallbackRoutingTest.TEXT,
+                linked_accounts=[{"platform": "douyin", "account_key": "pb"}],
+                receipts=[{"receipt_id": "PRB", "platform": "douyin", "status": "accepted"}]
+            ), AGENT)["incident_id"]
+            sugg = next(s for s in app.list_suggestions()
+                        if set(s["incident_ids"]) == {a_id, b_id})
+            app.resolve_suggestion(sugg["suggestion_id"], "accept", OFFICER,
+                                   target_incident=a_id)
+            merge_seq = max(e["seq"] for e in app.store.replay()
+                            if e["type"] == "incidents_merged")
+            # 合并后，凭子案件回执号命中的迟到删除回执
+            app.platform_callback({
+                "callback_id": "CB-P-MERGED",
+                "receipt": {"receipt_id": "PRB", "platform": "douyin",
+                            "status": "removed",
+                            "content_url": MergedCallbackRoutingTest.URL_B}})
+
+            reloaded = SafeguardingApp(store_path=path)
+            self.assertEqual(reloaded.incidents[b_id]["merged_into"], a_id)
+            self.assertEqual(reloaded.incidents[a_id]["absorbed"], [b_id])
+            digest = reloaded.incident_digest(a_id)
+            by_url = {e["content_ref"]: e["state"] for e in digest["证据依据"]["evidence"]}
+            self.assertEqual(by_url[MergedCallbackRoutingTest.URL_B], "deleted")
+            self.assertIn("PRB", {r["receipt_id"]
+                                  for r in digest["证据依据"]["platform_receipts"]})
+            # 重放后旧子案件仍无任何合并之后的写入
+            later_child = [e for e in reloaded.store.replay()
+                           if e["seq"] > merge_seq
+                           and e["payload"].get("incident_id") == b_id]
+            self.assertEqual(later_child, [])
+            # 重放后凭旧子案件显式编号仍路由主案件
+            routed = reloaded.platform_callback({
+                "callback_id": "CB-P-AFTER-RESTART", "incident_id": b_id,
+                "receipt": {"receipt_id": "PRC", "platform": "douyin", "status": "accepted"}})
+            self.assertEqual(routed["incident_id"], a_id)
+            # 重放后首次回调原样重放仍幂等
+            again = reloaded.platform_callback({
+                "callback_id": "CB-P-MERGED",
+                "receipt": {"receipt_id": "PRB", "platform": "douyin",
+                            "status": "removed",
+                            "content_url": MergedCallbackRoutingTest.URL_B}})
+            self.assertTrue(again["duplicate"])
+
+
+class AtomicBatchStoreTest(unittest.TestCase):
+    def test_append_many_is_contiguous_and_all_or_nothing(self):
+        store = EventStore()
+        seen = []
+        store.subscribe(lambda event: seen.append(event["type"]))
+        events = store.append_many([
+            ("receipt_recorded", {"incident_id": "i", "receipt_id": "r1"}),
+            ("content_state_changed", {"incident_id": "i", "evidence_id": "e1"}),
+            ("callback_processed", {"callback_id": "c1"}),
+        ])
+        self.assertEqual([e["seq"] for e in events], [1, 2, 3])  # 连续序号
+        self.assertEqual(seen, ["receipt_recorded", "content_state_changed",
+                                "callback_processed"])  # 投影按序一次性可见
+        self.assertEqual(len(store.replay()), 3)
+
+
+class HttpMergedCallbackTest(unittest.TestCase):
+    """HTTP 层证明：合并后回调归属主案件、子案件不被写、冲突与关闭稳定报错。"""
+
+    URL_A = "https://weibo.example/comment/100"
+    URL_B = "https://weibo.example/comment/100?mirror=2"
+    TEXT = "这人就该被网暴到退役，全家都不是好东西"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = SafeguardingApp()
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), build_handler(cls.app))
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base_url = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def _request(self, method, path, payload=None):
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        request = Request(f"{self.base_url}{path}", data=data, method=method,
+                          headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(request, timeout=3) as response:
+                return response.status, json.load(response)
+        except HTTPError as error:
+            return error.code, json.load(error)
+
+    def test_merged_callback_routing_over_http(self):
+        def report(url, account):
+            return self._request("POST", "/reports", abuse_report(
+                actor=AGENT, victim_code="ATH-HTTP", content_url=url,
+                raw_excerpt=self.TEXT, platform="weibo",
+                linked_accounts=[{"platform": "weibo", "account_key": account,
+                                  "display_name": account}]))
+
+        status, body_a = report(self.URL_A, "h_acc_a")
+        self.assertEqual(status, 201)
+        a = body_a["incident_id"]
+        _, body_b = report(self.URL_B, "h_acc_b")
+        b = body_b["incident_id"]
+
+        status, suggestions = self._request("GET", "/suggestions")
+        self.assertEqual(status, 200)
+        sugg = next(s for s in suggestions["suggestions"]
+                    if set(s["incident_ids"]) == {a, b})
+        status, merged = self._request("POST", f"/suggestions/{sugg['suggestion_id']}",
+                                       {"actor": OFFICER, "decision": "accept",
+                                        "target_incident": a})
+        self.assertEqual(status, 200)
+        self.assertEqual(merged["merged_into"], a)
+
+        # 平台迟到删除回执仍携带旧子案件编号
+        cb = {"callback_id": "CB-HTTP-MERGED", "incident_id": b,
+              "receipt": {"receipt_id": "HRC-1", "platform": "weibo",
+                          "status": "removed", "content_url": self.URL_B}}
+        status, body = self._request("POST", "/callbacks/platform", cb)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["incident_id"], a)
+        self.assertEqual(body["matched_via"], "explicit_incident_id")
+
+        status, digest_a = self._request("GET", f"/incidents/{a}/digest")
+        self.assertEqual(status, 200)
+        by_url = {e["content_ref"]: e["state"]
+                  for e in digest_a["证据依据"]["evidence"]}
+        self.assertEqual(by_url[self.URL_B], "deleted")
+        self.assertEqual(digest_a["absorbed_incidents"], [b])
+
+        status, digest_b = self._request("GET", f"/incidents/{b}/digest")
+        self.assertEqual(status, 200)
+        self.assertEqual(digest_b["merged_into"], a)
+        self.assertNotIn("HRC-1",
+                         {r["receipt_id"] for r in digest_b["证据依据"]["platform_receipts"]})
+
+        # 新旧编号的通知查询结论一致（本案无通知，均为空且等价）
+        _, n_a = self._request("GET", f"/notifications?incident_id={a}")
+        _, n_b = self._request("GET", f"/notifications?incident_id={b}")
+        self.assertEqual(n_a, n_b)
+
+        # 原样重放安全
+        status, again = self._request("POST", "/callbacks/platform", cb)
+        self.assertEqual(status, 200)
+        self.assertTrue(again["duplicate"])
+
+        # 同标识不同内容：HTTP 409，回传首次结果
+        conflict = json.loads(json.dumps(cb))
+        conflict["receipt"]["status"] = "processing"
+        status, err = self._request("POST", "/callbacks/platform", conflict)
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error_code"], "callback_conflict")
+        self.assertEqual(err["first_result"]["incident_id"], a)
+
+        # 主案件关闭后迟到回调：稳定 409，不另立案件
+        self._request("POST", f"/incidents/{a}/close", {"actor": OFFICER, "reason": "完结"})
+        status, err = self._request("POST", "/callbacks/platform",
+                                    {"callback_id": "CB-HTTP-CLOSED", "incident_id": b,
+                                     "receipt": {"receipt_id": "HRC-2", "platform": "weibo",
+                                                 "status": "removed",
+                                                 "content_url": self.URL_B}})
+        self.assertEqual(status, 409)
+        self.assertEqual(err["error_code"], "incident_closed")
+
+
 class AppealTest(unittest.TestCase):
     def setUp(self):
         self.app = SafeguardingApp()
@@ -366,11 +871,23 @@ class PersistenceTest(unittest.TestCase):
 
             reloaded = SafeguardingApp(store_path=path)
             self.assertIn(incident_id, reloaded.incidents)
-            again = reloaded.platform_callback({
+            # 重启后以完全相同的回执重放：仍识别为重复，不二次处理
+            same_cb = {
                 "callback_id": "CB-PERSIST", "incident_id": incident_id,
-                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "removed"}})
+                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "processing"}}
+            again = reloaded.platform_callback(same_cb)
             self.assertTrue(again["duplicate"])  # 重放后重复回调仍不二次处理
             self.assertEqual(len(reloaded.list_notifications()), 0)
+            # 同一 callback_id 改带不同删除状态：冲突保留首次结果，不落账
+            conflict_cb = dict(same_cb)
+            conflict_cb["receipt"] = dict(same_cb["receipt"], status="removed")
+            with self.assertRaises(AppError) as ctx:
+                reloaded.platform_callback(conflict_cb)
+            self.assertEqual(ctx.exception.status, 409)
+            self.assertEqual(ctx.exception.details["first_result"]["incident_id"], incident_id)
+            states = [e["state"] for e in
+                      reloaded.incident_digest(incident_id)["证据依据"]["evidence"]]
+            self.assertNotIn("deleted", states)  # 冲突内容没有写入
 
 
 class HttpContractTest(unittest.TestCase):

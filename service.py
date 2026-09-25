@@ -47,6 +47,12 @@ def build_handler(app):
                 actor = {"name": actor}
             return actor
 
+        def _send_error(self, error):
+            payload = {"error": str(error)}
+            if getattr(error, "details", None):
+                payload.update(error.details)
+            self._send_json(error.status, payload)
+
         def do_GET(self):
             parsed = urlparse(self.path)
             query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
@@ -73,7 +79,7 @@ def build_handler(app):
                 else:
                     self._send_json(404, {"error": "路由不存在", "path": parsed.path})
             except AppError as error:
-                self._send_json(error.status, {"error": str(error)})
+                self._send_error(error)
 
         def do_POST(self):
             parsed = urlparse(self.path)
@@ -154,7 +160,7 @@ def build_handler(app):
                         return
                     self._send_json(200, result)
 
-                elif len(parts) == 3 and parts[0] == "suggestions":
+                elif len(parts) == 2 and parts[0] == "suggestions":
                     actor = self._actor(body)
                     result = app.resolve_suggestion(
                         parts[1], body.get("decision"), actor,
@@ -164,7 +170,7 @@ def build_handler(app):
                 else:
                     self._send_json(404, {"error": "路由不存在", "path": path})
             except AppError as error:
-                self._send_json(error.status, {"error": str(error)})
+                self._send_error(error)
 
         def log_message(self, *_args):
             return

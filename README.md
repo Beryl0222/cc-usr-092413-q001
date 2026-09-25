@@ -11,6 +11,7 @@
 - **职责分离**：平台投诉→平台联络员复核；报案、公开澄清→法务复核员复核；提交人不得复核自己发起的动作。
 - **授权驱动**：当事人当前授权不足时，已批准的对外动作保持 blocked；撤回授权不抹除已完成动作与既有责任链；申诉/司法程序存续期间证据留存授权不可撤回。
 - **回调幂等**：平台回调按 `callback_id` 去重，重复回调返回 `duplicate=true`，不通知、不产生第二案件、不重复挂回执；回调无法凭匿名内容另立案件。
+- **合并后回调归属**：合并确认后，无论回调凭显式案件号（含旧子案件编号）、既有回执号还是内容引用命中，都沿合并链解析到唯一主案件；新增回执、删除状态、关联账号原子地记入主案件并保留原始命中来源（`matched_via`/`matched_ref`），被吸收的旧子案件不再发生任何业务变更。同一 `callback_id` 携带不同业务内容时保留首次结果并返回 409 冲突（`error_code=callback_conflict`，附首次结果），不做部分写入；合并链异常、主案件已关闭、多线索无法唯一归属时返回稳定业务错误（409/404），绝不另立案件。
 - **误报申诉**：申诉期间事件置"申诉中"，敏感材料仅法务复核员与值班主管可见，并阻断新的对外动作。
 - **直接威胁去重**：同一事件值班周期内重复确认威胁等级只刷新确认时间，不产生第二案件或第二次通知。
 
@@ -20,7 +21,7 @@
 python3 service.py --check          # 检查配置与可重放账本
 python3 service.py --port 8000      # 内存账本（联调）
 python3 service.py --data data/events.jsonl   # 追加式持久化账本（重启可重放）
-npm test                            # 全部契约测试（27 项）
+npm test                            # 全部契约测试（43 项）
 ```
 
 ## HTTP 接口
@@ -43,7 +44,7 @@ npm test                            # 全部契约测试（27 项）
 | POST | `/incidents/{id}/consent/grant` `/consent/revoke` | 当事人代理授予/撤回授权 |
 | POST | `/incidents/{id}/appeal` `/appeal/resolve` | 发起误报申诉、法务裁定（upheld/dismissed） |
 | POST | `/suggestions/{id}` | 保护专员 accept/reject 合并建议（accept 时给 `target_incident`） |
-| POST | `/callbacks/platform` | 平台/采集回调（幂等键 `callback_id`；可携带回执、删除状态、改名信息） |
+| POST | `/callbacks/platform` | 平台/采集回调（幂等键 `callback_id`；可携带回执、删除状态、改名信息；命中旧子案件编号时自动归属主案件） |
 | POST | `/incidents/{id}/close` | 关闭事件（存在未响应升级或未完成动作时拒绝） |
 
 ## 代码结构
