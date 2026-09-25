@@ -5,11 +5,15 @@
 - 普通批评只登记线索、不立事件；直接人身威胁自动按值班规则升级且只通知一次；
 - 聚类只产生合并建议，须保护专员人工确认；
 - 报案/平台投诉/公开澄清按职责分离提交、分角色复核，禁止自复核；
-- 平台回调按 callback_id 幂等，重复回调不通知、不产生第二案件；
+- 平台回调按 callback_id 幂等：重复回调返回首次结果，同键不同内容保留首次结果
+  并明确报冲突；命中已合并子案件时一律归并到唯一主案件，事实原子记入主链并
+  保留原始命中来源，旧子案件不再发生业务变更，也绝不另立案件；
 - 申诉期间限制敏感材料扩散并阻断对外动作；授权撤回不抹除责任链。
 """
 
 import hashlib
+import json
+import threading
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -28,6 +32,12 @@ def now_iso():
 
 def content_hash(raw_excerpt):
     return hashlib.sha256((raw_excerpt or "").encode("utf-8")).hexdigest()
+
+
+def callback_fingerprint(payload):
+    """回调内容指纹：同一 callback_id 再次到达时用于识别内容是否变化。"""
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def suggest_severity(text):
@@ -67,6 +77,8 @@ class SafeguardingApp:
         self.callbacks = {}          # callback_id -> 首次处理结果
         self.notifications = []      # 通知外发箱（抽象渠道）
         self._suggestion_keys = set()
+        # 串行化合并、关闭与平台回调：并发时只形成一个可解释顺序
+        self._lock = threading.RLock()
         self._replay()
         self.store.subscribe(self._apply)
 
@@ -274,8 +286,11 @@ class SafeguardingApp:
 
     def _on_content_state_changed(self, p):
         inc = self.incidents.get(p["incident_id"])
-        if inc:
-            for ev in inc["evidence"]:
+        if not inc:
+            return
+        # 删除状态可能指向被吸收子案件的证据：在整个合并组内定位
+        for member in self._merge_group(inc):
+            for ev in member["evidence"]:
                 if ev["evidence_id"] == p["evidence_id"]:
                     ev["state"] = p["new_state"]
 
@@ -292,17 +307,26 @@ class SafeguardingApp:
 
     def _on_account_renamed(self, p):
         inc = self.incidents.get(p["incident_id"])
-        if inc:
-            for acct in inc["accounts"]:
+        if not inc:
+            return
+        # 改名事实记在主链，但账号引用可能落在被吸收子案件：合并组内同步更新
+        for member in self._merge_group(inc):
+            for acct in member["accounts"]:
                 if acct["platform"] == p["platform"] and acct["account_key"] == p["account_key"]:
                     acct["name_history"].append({"name": p["new_name"], "at": p["at"]})
                     acct["display_name"] = p["new_name"]
 
+    def _record_receipt(self, inc, receipt):
+        """回执按 receipt_id 在合并组内去重后落到指定案件：同一回执的最新状态只保留一份。"""
+        receipt_id = receipt.get("receipt_id")
+        for member in self._merge_group(inc):
+            member["receipts"] = [r for r in member["receipts"] if r["receipt_id"] != receipt_id]
+        inc["receipts"].append(receipt)
+
     def _on_receipt_recorded(self, p):
         inc = self.incidents.get(p["incident_id"])
         if inc:
-            inc["receipts"] = [r for r in inc["receipts"] if r["receipt_id"] != p["receipt_id"]]
-            inc["receipts"].append({
+            self._record_receipt(inc, {
                 "receipt_id": p["receipt_id"], "platform": p["platform"],
                 "status": p["status"], "reported_at": p.get("reported_at"),
                 "via": p.get("via", "callback"), "at": p["at"],
@@ -415,17 +439,17 @@ class SafeguardingApp:
             if p.get("receipt"):
                 inc = self.incidents.get(action["incident_id"])
                 if inc:
-                    receipt = p["receipt"]
-                    inc["receipts"] = [r for r in inc["receipts"]
-                                       if r["receipt_id"] != receipt.get("receipt_id")]
-                    inc["receipts"].append({"via": "action", "at": p["at"], **receipt})
+                    self._record_receipt(inc, {"via": "action", "at": p["at"], **p["receipt"]})
 
     def _on_notification_sent(self, p):
         self.notifications.append(p)
 
     def _on_callback_processed(self, p):
         if p["callback_id"] not in self.callbacks:
-            self.callbacks[p["callback_id"]] = p["result"]
+            stored = dict(p["result"])
+            if p.get("request_hash") is not None:
+                stored["request_hash"] = p["request_hash"]
+            self.callbacks[p["callback_id"]] = stored
 
     # ------------------------------------------------------------- 严重度确认
     def confirm_severity(self, incident_id, severity, actor):
@@ -551,30 +575,31 @@ class SafeguardingApp:
 
     def resolve_suggestion(self, suggestion_id, decision, actor, target_incident=None):
         _require(actor, ("俱乐部保护专员",))
-        sugg = self.suggestions.get(suggestion_id)
-        if not sugg:
-            raise AppError("合并建议不存在", 404)
-        if sugg["status"] != "open":
-            raise AppError("该建议已处理")
-        if decision not in ("accept", "reject"):
-            raise AppError("decision 仅支持 accept/reject")
-        merged_into = None
-        if decision == "accept":
-            merged_into = target_incident or sugg["incident_ids"][0]
-            source_id = sugg["incident_ids"][1] if merged_into == sugg["incident_ids"][0] else sugg["incident_ids"][0]
-            if merged_into not in sugg["incident_ids"]:
-                raise AppError("合并目标必须是建议涉及的事件之一")
-            self._get_open_incident(merged_into)
-            self._get_open_incident(source_id)
-            self._append("incidents_merged", {
-                "survivor_id": merged_into, "merged_id": source_id,
-                "by": actor.get("name"), "at": now_iso(),
+        with self._lock:
+            sugg = self.suggestions.get(suggestion_id)
+            if not sugg:
+                raise AppError("合并建议不存在", 404)
+            if sugg["status"] != "open":
+                raise AppError("该建议已处理")
+            if decision not in ("accept", "reject"):
+                raise AppError("decision 仅支持 accept/reject")
+            merged_into = None
+            if decision == "accept":
+                merged_into = target_incident or sugg["incident_ids"][0]
+                source_id = sugg["incident_ids"][1] if merged_into == sugg["incident_ids"][0] else sugg["incident_ids"][0]
+                if merged_into not in sugg["incident_ids"]:
+                    raise AppError("合并目标必须是建议涉及的事件之一")
+                self._get_open_incident(merged_into)
+                self._get_open_incident(source_id)
+                self._append("incidents_merged", {
+                    "survivor_id": merged_into, "merged_id": source_id,
+                    "by": actor.get("name"), "at": now_iso(),
+                })
+            self._append("suggestion_resolved", {
+                "suggestion_id": suggestion_id, "decision": decision,
+                "by": actor.get("name"), "at": now_iso(), "merged_into": merged_into,
             })
-        self._append("suggestion_resolved", {
-            "suggestion_id": suggestion_id, "decision": decision,
-            "by": actor.get("name"), "at": now_iso(), "merged_into": merged_into,
-        })
-        return {"status": decision, "merged_into": merged_into}
+            return {"status": decision, "merged_into": merged_into}
 
     # ------------------------------------------------------------------ 授权
     def grant_consent(self, incident_id, scopes, actor):
@@ -706,128 +731,237 @@ class SafeguardingApp:
 
     def resolve_appeal(self, incident_id, decision, actor, note=None):
         _require(actor, ("法务复核员",))
-        inc = self._get_incident(incident_id)
-        if not inc["appeal"] or inc["appeal"]["status"] != "open":
-            raise AppError("该事件没有待裁定的申诉")
-        if decision not in ("upheld", "dismissed"):
-            raise AppError("decision 仅支持 upheld（误报成立）/dismissed（申诉驳回）")
-        self._append("appeal_resolved", {
-            "incident_id": incident_id, "decision": decision,
-            "by": actor.get("name"), "at": now_iso(), "note": note,
-        })
-        if decision == "upheld":
-            self._append("incident_closed", {
-                "incident_id": incident_id,
-                "reason": "误报申诉成立，按误报关闭（责任链留存）",
-                "by": actor.get("name"), "at": now_iso(),
+        with self._lock:
+            inc = self._get_incident(incident_id)
+            if not inc["appeal"] or inc["appeal"]["status"] != "open":
+                raise AppError("该事件没有待裁定的申诉")
+            if decision not in ("upheld", "dismissed"):
+                raise AppError("decision 仅支持 upheld（误报成立）/dismissed（申诉驳回）")
+            self._append("appeal_resolved", {
+                "incident_id": incident_id, "decision": decision,
+                "by": actor.get("name"), "at": now_iso(), "note": note,
             })
+            if decision == "upheld":
+                self._append("incident_closed", {
+                    "incident_id": incident_id,
+                    "reason": "误报申诉成立，按误报关闭（责任链留存）",
+                    "by": actor.get("name"), "at": now_iso(),
+                })
 
     def close_incident(self, incident_id, reason, actor):
         _require(actor, ("俱乐部保护专员", "法务复核员"))
-        inc = self._get_open_incident(incident_id)
-        pending = [a for a in inc["actions"] if self.actions[a]["status"] in ("pending", "approved")]
-        if inc["escalation"] and inc["escalation"]["status"] == "open":
-            raise AppError("值班升级尚未响应，不能关闭事件")
-        if pending:
-            raise AppError(f"尚有 {len(pending)} 个保护动作未完成，不能关闭事件")
-        self._append("incident_closed", {
-            "incident_id": incident_id, "reason": reason or "保护动作完成，关闭",
-            "by": actor.get("name"), "at": now_iso(),
-        })
+        with self._lock:
+            inc = self._get_open_incident(incident_id)
+            pending = [a for a in inc["actions"] if self.actions[a]["status"] in ("pending", "approved")]
+            if inc["escalation"] and inc["escalation"]["status"] == "open":
+                raise AppError("值班升级尚未响应，不能关闭事件")
+            if pending:
+                raise AppError(f"尚有 {len(pending)} 个保护动作未完成，不能关闭事件")
+            self._append("incident_closed", {
+                "incident_id": incident_id, "reason": reason or "保护动作完成，关闭",
+                "by": actor.get("name"), "at": now_iso(),
+            })
 
     # ------------------------------------------------------------------ 回调
     def platform_callback(self, payload):
-        """平台/采集回调。以 callback_id 幂等：重复回调不通知、不产生第二案件。"""
-        callback_id = payload.get("callback_id")
-        if not callback_id:
-            raise AppError("回调必须携带 callback_id")
-        if callback_id in self.callbacks:
-            first = self.callbacks[callback_id]
-            return {"duplicate": True, "callback_id": callback_id, **first}
+        """平台/采集回调。
 
-        incident = self._resolve_callback_incident(payload)
-        if incident is None:
-            raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
-        incident_id = incident["incident_id"]
-        at = now_iso()
-        attached = []
+        - 以 callback_id 幂等：重复回调返回首次处理结果（duplicate=true）；
+          同一 callback_id 携带不同内容时保留首次结果并明确报冲突
+          （conflict=true），不再写入任何事件；
+        - 回调无论通过显式案件号、既有回执号还是内容引用命中被吸收子案件，
+          都解析到唯一主案件，新增事实原子记入主链，并保留原始命中来源
+          （hit_via / routed_from）；旧子案件不再发生业务变更；
+        - 合并链异常、主案件已关闭、多条线索无法唯一归属时返回稳定业务错误，
+          绝不另立案件。
+        """
+        with self._lock:
+            callback_id = payload.get("callback_id")
+            if not callback_id:
+                raise AppError("回调必须携带 callback_id")
+            request_hash = callback_fingerprint(payload)
+            known = self.callbacks.get(callback_id)
+            if known is not None:
+                first = {k: v for k, v in known.items() if k != "request_hash"}
+                response = {"duplicate": True, "callback_id": callback_id, **first}
+                if known.get("request_hash") is not None and known["request_hash"] != request_hash:
+                    response["conflict"] = True
+                    response["conflict_detail"] = (
+                        "同一 callback_id 的回调内容与首次处理不一致，"
+                        "已保留首次处理结果，本次内容不写入")
+                return response
 
-        receipt = payload.get("receipt")
-        if receipt and receipt.get("receipt_id"):
-            self._append("receipt_recorded", {
-                "incident_id": incident_id,
-                "receipt_id": receipt["receipt_id"],
-                "platform": receipt.get("platform", payload.get("platform")),
-                "status": receipt.get("status"),
-                "reported_at": receipt.get("reported_at", at),
-                "via": "callback", "at": at,
-            })
-            attached.append("receipt")
-            if receipt.get("status") == "removed":
-                evidence = self._evidence_for(incident, receipt.get("content_url"))
-                if evidence:
-                    self._append("content_state_changed", {
-                        "incident_id": incident_id, "evidence_id": evidence["evidence_id"],
-                        "old_state": evidence["state"], "new_state": "deleted",
-                        "source": "platform_callback", "at": at,
-                    })
-                    attached.append("content_deleted")
+            incident, hit = self._resolve_callback_incident(payload)
+            if incident is None:
+                raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
+            incident_id = incident["incident_id"]
+            at = now_iso()
+            routed_from = [iid for iid in hit["matched_incident_ids"] if iid != incident_id]
+            origin = {"callback_id": callback_id, "hit_via": list(hit["via"])}
+            if routed_from:
+                origin["routed_from"] = routed_from
 
-        account = payload.get("account")
-        if account and account.get("account_key"):
-            matched = next((a for a in incident["accounts"]
-                            if a["platform"] == account.get("platform")
-                            and a["account_key"] == account["account_key"]), None)
-            if matched:
-                new_name = account.get("display_name")
-                if new_name and new_name != matched["display_name"]:
-                    self._append("account_renamed", {
-                        "incident_id": incident_id,
-                        "platform": matched["platform"],
-                        "account_key": matched["account_key"],
-                        "old_name": matched["display_name"],
-                        "new_name": new_name, "at": at,
-                    })
-                    attached.append("account_renamed")
-            else:
-                self._append("account_linked", {
-                    "incident_id": incident_id, "link_id": new_id("acct"),
-                    "platform": account.get("platform", payload.get("platform")),
-                    "account_key": account["account_key"], "url": account.get("url"),
-                    "display_name": account.get("display_name"), "at": at,
-                })
-                attached.append("account_linked")
+            attached = []
+            events = []
+            receipt = payload.get("receipt")
+            if receipt and receipt.get("receipt_id"):
+                events.append(("receipt_recorded", {
+                    "incident_id": incident_id,
+                    "receipt_id": receipt["receipt_id"],
+                    "platform": receipt.get("platform", payload.get("platform")),
+                    "status": receipt.get("status"),
+                    "reported_at": receipt.get("reported_at", at),
+                    "via": "callback", "at": at, **origin,
+                }))
+                attached.append("receipt")
+                if receipt.get("status") == "removed":
+                    evidence = self._evidence_for(incident, receipt.get("content_url"))
+                    if evidence:
+                        events.append(("content_state_changed", {
+                            "incident_id": incident_id,
+                            "evidence_id": evidence["evidence_id"],
+                            "old_state": evidence["state"], "new_state": "deleted",
+                            "source": "platform_callback", "at": at, **origin,
+                        }))
+                        attached.append("content_deleted")
 
-        # 回调附件不产生任何通知，也绝不另立案件
-        result = {"duplicate": False, "callback_id": callback_id,
-                  "incident_id": incident_id, "attached": attached}
-        stored = {k: v for k, v in result.items() if k != "duplicate"}
-        self.callbacks[callback_id] = stored
-        # 事件化记录，保证账本重放（含重启）后幂等索引仍然有效
-        self._append("callback_processed", {"callback_id": callback_id, "result": stored, "at": at})
-        return result
+            account = payload.get("account")
+            if account and account.get("account_key"):
+                matched = self._account_in_group(incident, account)
+                if matched:
+                    new_name = account.get("display_name")
+                    if new_name and new_name != matched["display_name"]:
+                        events.append(("account_renamed", {
+                            "incident_id": incident_id,
+                            "platform": matched["platform"],
+                            "account_key": matched["account_key"],
+                            "old_name": matched["display_name"],
+                            "new_name": new_name, "at": at, **origin,
+                        }))
+                        attached.append("account_renamed")
+                else:
+                    events.append(("account_linked", {
+                        "incident_id": incident_id, "link_id": new_id("acct"),
+                        "platform": account.get("platform", payload.get("platform")),
+                        "account_key": account["account_key"], "url": account.get("url"),
+                        "display_name": account.get("display_name"), "at": at, **origin,
+                    }))
+                    attached.append("account_linked")
+
+            # 回调附件不产生任何通知，也绝不另立案件
+            result = {"duplicate": False, "callback_id": callback_id,
+                      "incident_id": incident_id, "attached": attached,
+                      "hit_via": list(hit["via"])}
+            if routed_from:
+                result["routed_from"] = routed_from
+            stored = {k: v for k, v in result.items() if k != "duplicate"}
+            events.append(("callback_processed", {
+                "callback_id": callback_id, "result": stored,
+                "request_hash": request_hash, "at": at,
+            }))
+            # 同一回调的全部事实与幂等标记原子落账：不部分写入，重放后结论一致
+            self.store.append_many(events)
+            return result
 
     def _resolve_callback_incident(self, payload):
+        """解析回调归属。
+
+        显式案件号、既有回执号、内容引用三条线索各自命中后，都先沿合并链归并
+        到唯一主案件；返回 (主案件, 命中来源)。无命中返回 (None, None)；
+        合并链异常、主案件已关闭、线索指向不同主案件时抛出稳定业务错误。
+        """
+        hits = []
+        seen = set()
+
+        def add_hit(via, incident):
+            key = (via, incident["incident_id"])
+            if key not in seen:
+                seen.add(key)
+                hits.append((via, incident["incident_id"]))
+
         explicit = payload.get("incident_id")
         if explicit and explicit in self.incidents:
-            return self.incidents[explicit]
+            add_hit("incident_id", self.incidents[explicit])
         receipt = payload.get("receipt") or {}
         receipt_id = receipt.get("receipt_id")
         if receipt_id:
             for inc in self.incidents.values():
                 if any(r["receipt_id"] == receipt_id for r in inc["receipts"]):
-                    return inc
+                    add_hit("receipt", inc)
         url = receipt.get("content_url") or payload.get("content_url")
         if url:
             for inc in self.incidents.values():
                 if any(e["content_ref"] == url for e in inc["evidence"]):
-                    return inc
-        return None
+                    add_hit("content_url", inc)
+        if not hits:
+            return None, None
+        roots = {}
+        for _via, incident_id in hits:
+            root = self._merge_root(self.incidents[incident_id])
+            roots[root["incident_id"]] = root
+        if len(roots) > 1:
+            raise AppError(
+                "回调线索无法唯一归属：命中多个未合并事件（"
+                + "、".join(sorted(roots))
+                + "），请由保护专员确认合并或补充明确案件号", 409)
+        root = next(iter(roots.values()))
+        if root.get("closed_at"):
+            raise AppError(
+                f"主案件 {root['incident_id']} 已关闭，回调事实不再写入，也不另立案件", 409)
+        hit = {"via": [via for via, _ in hits],
+               "matched_incident_ids": sorted({iid for _, iid in hits})}
+        return root, hit
+
+    def _merge_root(self, incident):
+        """沿 merged_into 链解析唯一主案件；链异常（成环、目标缺失）报稳定业务错误。"""
+        seen = {incident["incident_id"]}
+        current = incident
+        while current.get("merged_into"):
+            target_id = current["merged_into"]
+            if target_id in seen:
+                raise AppError(f"合并链异常：{target_id} 在合并链中成环", 409)
+            seen.add(target_id)
+            target = self.incidents.get(target_id)
+            if target is None:
+                raise AppError(
+                    f"合并链异常：{current['incident_id']} 的主案件 {target_id} 不存在", 409)
+            current = target
+        return current
+
+    def _merge_group(self, incident):
+        """主案件及其吸收的全部子案件（含间接吸收），用于统一视图与组内投影。"""
+        group = [incident]
+        seen = {incident["incident_id"]}
+        queue = list(incident.get("absorbed", []))
+        while queue:
+            member_id = queue.pop(0)
+            if member_id in seen:
+                continue
+            seen.add(member_id)
+            member = self.incidents.get(member_id)
+            if member is None:
+                continue
+            group.append(member)
+            queue.extend(member.get("absorbed", []))
+        return group
 
     def _evidence_for(self, incident, url):
         if not url:
             return None
-        return next((e for e in incident["evidence"] if e["content_ref"] == url), None)
+        for member in self._merge_group(incident):
+            found = next((e for e in member["evidence"] if e["content_ref"] == url), None)
+            if found:
+                return found
+        return None
+
+    def _account_in_group(self, incident, account):
+        for member in self._merge_group(incident):
+            found = next((a for a in member["accounts"]
+                          if a["platform"] == account.get("platform")
+                          and a["account_key"] == account["account_key"]), None)
+            if found:
+                return found
+        return None
 
     # ------------------------------------------------------------------ 查询
     def _get_incident(self, incident_id):
@@ -864,26 +998,44 @@ class SafeguardingApp:
         return "已受理"
 
     def incident_digest(self, incident_id, as_role=None):
-        """保护专员视角的统一视图：证据依据、处置决定、授权范围、待办保护动作。"""
+        """保护专员视角的统一视图：证据依据、处置决定、授权范围、待办保护动作。
+
+        合并后被吸收子案件的证据、关联账号与平台回执一并并入主案件视图，
+        并以 source_incident 标注来源案件，保证统一视图完整承接回调事实。
+        """
         inc = self._get_incident(incident_id)
         appeal_open = inc["appeal"] and inc["appeal"]["status"] == "open"
         mask = appeal_open and not (as_role and self.config.appeal_can_view_sensitive(as_role))
+        group = self._merge_group(inc)
 
-        evidence = [{
-            "evidence_id": e["evidence_id"], "kind": e["kind"],
-            "content_ref": "【申诉期间已限制查看】" if mask else e["content_ref"],
-            "content_sha256": e["content_sha256"], "state": e["state"],
-            "submitted_by": e["submitted_by"], "at": e["at"], "note": e["note"],
-        } for e in inc["evidence"]]
+        evidence = []
+        for member in group:
+            for e in member["evidence"]:
+                evidence.append({
+                    "evidence_id": e["evidence_id"], "kind": e["kind"],
+                    "content_ref": "【申诉期间已限制查看】" if mask else e["content_ref"],
+                    "content_sha256": e["content_sha256"], "state": e["state"],
+                    "submitted_by": e["submitted_by"], "at": e["at"], "note": e["note"],
+                    "source_incident": member["incident_id"],
+                })
 
-        accounts = [{
-            "platform": "【申诉期间已限制】" if mask else a["platform"],
-            "account_key": "【申诉期间已限制】" if mask else a["account_key"],
-            "url": "【申诉期间已限制】" if mask else a.get("url"),
-            "display_name": "【申诉期间已限制】" if mask else a.get("display_name"),
-            "renamed": len(a["name_history"]) > 1,
-            "name_history": [] if mask else a["name_history"],
-        } for a in inc["accounts"]]
+        accounts = []
+        for member in group:
+            for a in member["accounts"]:
+                accounts.append({
+                    "platform": "【申诉期间已限制】" if mask else a["platform"],
+                    "account_key": "【申诉期间已限制】" if mask else a["account_key"],
+                    "url": "【申诉期间已限制】" if mask else a.get("url"),
+                    "display_name": "【申诉期间已限制】" if mask else a.get("display_name"),
+                    "renamed": len(a["name_history"]) > 1,
+                    "name_history": [] if mask else a["name_history"],
+                    "source_incident": member["incident_id"],
+                })
+
+        receipts = []
+        for member in group:
+            for r in member["receipts"]:
+                receipts.append({**r, "source_incident": member["incident_id"]})
 
         actions = [self._action_view(a, inc) for a in inc["actions"]]
         pending = [a["action_id"] for a in actions if a["status"] in ("pending", "approved", "blocked")]
@@ -901,7 +1053,7 @@ class SafeguardingApp:
             "证据依据": {
                 "evidence": evidence,
                 "linked_accounts": accounts,
-                "platform_receipts": inc["receipts"],
+                "platform_receipts": receipts,
             },
             "处置决定": actions,
             "当事人当前授权范围": [

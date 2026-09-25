@@ -88,8 +88,10 @@ def build_handler(app):
                     self._send_json(201 if result.get("incident_id") else 200, result)
 
                 elif path == "/callbacks/platform":
-                    # 平台回调：幂等键在体内，不带操作角色
-                    self._send_json(200, app.platform_callback(body))
+                    # 平台回调：幂等键在体内，不带操作角色；
+                    # 同一 callback_id 携带不同内容时以 409 报冲突并保留首次结果
+                    result = app.platform_callback(body)
+                    self._send_json(409 if result.get("conflict") else 200, result)
 
                 elif path == "/severity/suggest":
                     # 联调辅助：仅给严重度建议，最终等级以人工填报为准
@@ -154,7 +156,7 @@ def build_handler(app):
                         return
                     self._send_json(200, result)
 
-                elif len(parts) == 3 and parts[0] == "suggestions":
+                elif len(parts) == 2 and parts[0] == "suggestions":
                     actor = self._actor(body)
                     result = app.resolve_suggestion(
                         parts[1], body.get("decision"), actor,

@@ -57,6 +57,33 @@ class EventStore:
                 listener(event)
             return event, False
 
+    def append_many(self, items):
+        """原子追加一批 (event_type, payload)。
+
+        整批事件在同一临界区内落账并通知监听器：要么全部进入账本，
+        要么全部不进入，且不会与其他线程的事件交错，保证一批业务事实
+        （如一次平台回调的回执、删除状态与幂等标记）重放后仍是同一顺序。
+        """
+        with self._lock:
+            events = []
+            for event_type, payload in items:
+                event = {
+                    "event_id": new_id("evt"),
+                    "seq": len(self.events) + 1,
+                    "type": event_type,
+                    "payload": payload,
+                }
+                self.events.append(event)
+                events.append(event)
+            if self.path and events:
+                with open(self.path, "a", encoding="utf-8") as handle:
+                    for event in events:
+                        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+            for event in events:
+                for listener in list(self._listeners):
+                    listener(event)
+            return events
+
     def replay(self):
         with self._lock:
             return list(self.events)
